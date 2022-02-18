@@ -1,0 +1,420 @@
+---
+title: "Excess deaths and nowcasting"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(reshape2)
+library(ggplot2)
+library(MASS)
+library(nob)
+source('./functions/runIfExpired.R')
+```
+
+## Data
+
+We will be using several different datasets available from the US government and states
+
+1.  NCHS provisional death data for 2019, 2020 (Number of deaths per week)
+
+2.  Data from CDC's fluview system (also derived from NCHS) (fro pneumonia/influenza/COVID deaths: won't deal with this today)
+
+3.  NRESVSS influenza surveillance data, to adjust for flu activity
+
+## Practicalities
+
+A major challenge with this type of analysis is that it was being done in real-time as data accrued. As a result, data on deaths in the most recent weeks was incomplete and constantly changing. This made it very important to have a system for archiving/cataloging the data that is obtained so that changes can be tracked over time. This is important both for reproducibility and for adjusting the analysis for reporting delays
+
+1.  Get the latest **provisional** data
+
+2.  Archive and time stamp the provisional data
+
+3.  Merge the data with data back to 2014. and check the data
+
+4.  Compare archived datasets to estimate reporting delays by state (Bayesian Nowcasting with NobBS)
+
+5.  Fit the harmonic regression model, compare observed and expected values t get excess deaths
+
+## Get the latest data
+
+CDC makes data available through an **API**. This allows users to directly download the data. In this case, they have "provisional" death data for 2020 onwards on <https://data.cdc.gov/NCHS/Weekly-Provisional-Counts-of-Deaths-by-State-and-S/muzy-jte6>
+
+There are many different cuts of data provided by NCHS, some based on place of death, some based on place of residence. This can make a big difference. The dataset we are using is based on location of occurrence.
+
+You can download the data directly into R using a link provided on the data.cdc.gov website (go to Export, right clink on 'csv', copy link and paste below
+
+```{r}
+latest.data <- read.csv('https://data.cdc.gov/api/views/muzy-jte6/rows.csv?accessType=DOWNLOAD')
+```
+
+Because we want to archive the data, though, we are going to use a special function that will first check to see when we last downloaded this dataset, if it was more than X hours ago, it will download a new copy. In this case, the data is saved in a folder Data/nchs_base2_data and is saved as a time stamped rds file. If you set the number below very large, it won't download a new file. You might consider setting to 24 if you want it to update if most recent dataset is more than 24 hours old
+
+```{r}
+nchs.base2.data <- runIfExpired('nchs_base2_data', 
+ ~read.csv('https://data.cdc.gov/api/views/muzy-jte6/rows.csv?accessType=DOWNLOAD'),
+  maxage=hours(99999999999999)
+ )
+```
+
+## Harmonic Regression time!
+
+Here we are going to fit a harmonic regression to data from the pre-pandemic period (before March 1, 2020) and extrapolate it forward
+
+```{r}
+d1 <- readRDS('./Data/processed_data.rds')
+
+d1 <- d1[d1$state=='MA' ,]
+
+d1$deaths.corrected <- d1$nchs.total.deaths/d1$prop.complete
+
+```
+
+```{r}
+
+p1 <- ggplot(d1, aes( x=week_end , y= nchs.total.deaths) ) +
+  geom_line() +
+  theme_classic() +
+  ylim(0, max(c(d1$nchs.total.deaths, d1$deaths.corrected)))
+
+p1 +
+  geom_line(data=d1, aes(x=week_end, y=deaths.corrected), lty=2, col='red')
+  
+
+
+
+```
+
+Overlay flu aberrations
+
+```{r}
+p1 +
+  geom_line(data=d1, aes(x=week_end, y=log.flu.deseasonalize.0*max(nchs.total.deaths), col='red'))
+
+```
+
+Create the harmonic variables
+
+```{r}
+
+d1 <- d1[order(d1$week_end),]
+
+d1$t <- 1: nrow(d1)
+
+d1$sin1 <- sin(2*pi*d1$t/52.143)
+d1$cos1 <- cos(2*pi*d1$t/52.143)
+
+d1$sin2 <- sin(2*pi*d1$t*2/52.143)
+d1$cos2 <- cos(2*pi*d1$t*2/52.143)
+
+d1$sin3 <- sin(2*pi*d1$t*3/52.143)
+d1$cos3 <- cos(2*pi*d1$t*3/52.143)
+```
+
+Define outcome as total deaths per week before pandemic. Set deaths during pandemic to missing (NA)
+
+```{r}
+d1$deaths.pre <- d1$nchs.total.deaths
+d1$deaths.pre[d1$week_end >= '2020-03-01'] <- NA
+
+```
+
+Create offset: log(proportion complete)
+
+```{r}
+d1$log.prop.complete <- log(d1$prop.complete)
+
+```
+
+```{r}
+
+mod1 <- glm.nb(deaths.pre ~ sin1 +cos1 +sin2 +cos2 +sin3 +cos3 +
+                 t +
+                 log.flu.deseasonalize.0 +
+                 offset(log.prop.complete), data=d1)
+
+summary(mod1)
+
+d1$pred <- predict(mod1,type='response', newdata=d1)
+
+d1$excess <- d1$nchs.total.deaths - d1$pred
+```
+
+Look at the predictions
+
+```{r}
+p1 +
+  geom_line(data=d1, aes(x=week_end, y=pred, col='red')) 
+
+```
+
+Estimated excess deaths over time
+
+```{r}
+
+p2 <- ggplot(d1, aes( x=week_end , y= excess) ) +
+  geom_line() +
+  theme_classic() 
+
+p2
+
+```
+
+Let's count up excess deaths in this state from March 2020 onwards. We are going to round the estimates to avoid presenting false precision
+
+```{r}
+
+round(sum(d1$excess[d1$week_end>='2020-03-01']),-2)
+
+```
+
+Let's try with another state (FL)
+
+## Calculating uncertainty: 2-stage Monte Carlo approach
+
+### Prediction Intervals vs confidence intervals
+
+After fitting out model, we need to calculate **prediction intervals.** How is a prediction interval different from a confidence interval, you ask? A confidence interval captures the uncertainty from fitting the model to the data (parameter uncertainty). This represents a set pf plausible curves that could be fit to the data. A prediction interval represents the range where future values outside of the data used to fit the model are likely to fall. Prediction intervals account for both parameter uncertainty and observation uncertainty.
+
+### Monte Carlo approach to calculate prediction intervals
+
+There are some packages for calculating prediction intervals around the extrapolated values. However, we want to be able to do things like calculate the aggregate excess deaths for the pandemic period for the state, or even combine estimate between states. There isn't always a straightforward way to calculate the uncertainty around aggregations like this. Resampling approaches provide an alternative. we Will generate thousands of predicted trajectories based on parameter uncertainty and observation uncertainty. We can then calculate our aggregated values using each of these predicted trajectories separately. This yields thousands of estimates of excess deaths. We then calculate the percentiles of this set of estimates to get uncertainty intervals.
+
+First, lets try to just generate the predicted value using the mean estimate of the regression coefficients The prediction on the log scale is given by log(lambda) = X\*Beta + log(offset)
+
+```{r}
+
+summary(mod1)
+
+coefs.mod1 <- coef(mod1) #extract regression Coefficients
+
+X1 <- model.matrix(~sin1 +cos1 +sin2 +cos2 +sin3 +cos3 +
+                 t +
+                 log.flu.deseasonalize.0 , data=d1)
+
+d1$log.pred <- X1 %*% coefs.mod1 + d1$log.prop.complete
+
+p1 + 
+  geom_line(data=d1, aes(x=week_end, y=exp(log.pred)), col='red')
+
+```
+
+Now let's generate some samples based on the parameter uncertainty. This basically gives the uncertainty about where the line that runs through the fitted points should be placed. Each estimate for the regression coefficient has a variance around it, and their is covariance between the parameters. We therefore sample from a multivariate normal distribution.
+
+```{r}
+
+  set.seed (1234) #SET YOUR SEED!
+  
+  coefs.mod1 <- coef(mod1) #Mean estimate of the regression coefficients
+  
+  v.cov.mat <- vcov(mod1) 
+  
+    pred.coefs.reg.mean <-
+      MASS::mvrnorm(n = 1000,
+                    mu = coefs.mod1,
+                    Sigma = v.cov.mat)
+    
+    str(pred.coefs.reg.mean) #1000 estimates of the regression coefficient
+
+```
+
+Now generate 1000 version of the prediction line from these 1000 regression coefficients
+
+```{r}
+
+ log.preds.stage1.regmean <- X1 %*% t(pred.coefs.reg.mean)
+ 
+ 
+    log.preds.stage1.regmean <- apply(log.preds.stage1.regmean, 2,
+                                  function(x) x + d1$log.prop.complete)
+```
+
+```{r}
+
+log.preds.stage1.regmean.m <- melt(cbind.data.frame('date'=d1$week_end,log.preds.stage1.regmean), id.vars='date')
+p1 +
+  geom_line(data=log.preds.stage1.regmean.m, aes(x=date, y=exp(value), group=variable), col='blue', alpha=0.01)
+```
+
+Now we just have to take out 1000 trajectories and add observation noise. We will assume the trajectories represent the mean of a negative binomial distribution, and we will take samples from this distribution
+
+```{r}
+
+preds.stage2 <- rnbinom(n = length( log.preds.stage1.regmean) ,
+                            size = mod1$theta, mu = exp(log.preds.stage1.regmean))
+
+preds.stage2 <- matrix(preds.stage2, ncol=ncol(log.preds.stage1.regmean))
+```
+
+```{r}
+
+preds.stage2.m <- melt(cbind.data.frame('date'=d1$week_end,preds.stage2), id.vars='date')
+
+p1 +
+  geom_line(data=preds.stage2.m, aes(x=date, y=value, group=variable), col='blue', alpha=0.01)
+```
+
+Finally we can get uncertainty intervals at each time or overall
+
+By time point
+
+```{r}
+
+preds.ci <- as.data.frame(t(apply(preds.stage2, 1, quantile, probs=c(0.5, 0.025, 0.975))))
+
+names(preds.ci) <- c('pred.mc','lcl.mc','ucl.mc')
+
+preds.ci <- cbind.data.frame(d1, preds.ci)
+
+p2 <- ggplot(data=preds.ci, aes(x=week_end, y=nchs.total.deaths)) +
+               geom_line() +
+               theme_classic() +
+               geom_ribbon(aes(ymin=lcl.mc,ymax=ucl.mc ) , alpha=0.2)
+
+p2
+
+```
+
+Estimate excess deaths and uncertainty intervals for each week
+
+```{r}
+preds.ci <- preds.ci %>%
+  mutate('excess.mc'= nchs.total.deaths-pred.mc,
+         'excess.mc.lcl'= nchs.total.deaths-lcl.mc,
+         'excess.mc.ucl'= nchs.total.deaths-ucl.mc,
+         )
+
+p3 <- ggplot(data=preds.ci, aes(x=week_end, y=excess.mc)) +
+               geom_line() +
+               theme_classic() +
+               geom_ribbon(aes(ymin=excess.mc.lcl,ymax=excess.mc.ucl ) , alpha=0.2)+
+               ylab('Excess deaths per week') +
+                xlab('Date')
+
+p3
+```
+
+Estimate overall excess deaths by week, then take the 2.5th and 97.5th quantile of this to get your uncertainty range. We round it to avoid presenting false precision in the estimates.
+
+```{r}
+
+excess1 <- merge(preds.stage2.m, d1[,c('week_end','nchs.total.deaths')], 
+                 by.x='date', 
+                 by.y='week_end')
+
+#Generate 1000 estimates of total excess for period after March 1, 2020
+excess1 <- excess1[excess1$date>='2020-03-01',] %>%
+   mutate('excess'= nchs.total.deaths - value) %>%
+  group_by(variable) %>%
+  summarize('excessN' = sum(excess))
+
+excess2 <- quantile(excess1$excessN, probs=c(0.5, 0.025, 0.975))
+
+round(excess2, -2)
+  
+ 
+```
+
+## Nowcasting with NobBS
+
+Taking a step back: how did we estimate the factor we used to adjust the counts from more recent weeks for reporting delays.
+
+Once we have provisional data collected over multiple weeks, we can evaluate how the data changes over time. NobBS stands for Nowcasting by Bayesian Smoothing. It is described [here](https://journals.plos.org/ploscompbiol/article?id=10.1371/journal.pcbi.1007735) in a paper by Sarah McGough. As we will see, data trickles in over the course of many weeks. The goal of NobBS is to make a guess about how many cases/deaths will eventually be reported once all the data has come in, based on past reporting patterns and underlying trends in the data.
+
+```{r}
+e1 <- readRDS('./Data/fluview_archived_data.rds')
+
+e1 <- e1[e1$state=='Louisiana' & e1$death_date >= '2020-01-01',]
+
+View(e1)
+
+```
+
+View different version of the data
+
+```{r}
+e1.m <- melt(e1, id.vars=c('state','death_date'))
+
+pal1 = colorRampPalette(brewer.pal(9, "RdBu"))(length(unique(e1.m$variable)))
+
+
+
+ggplot(e1.m, aes(x=death_date, y=value, group=variable, color=variable)) +
+  geom_line() +
+  theme_classic()+
+  scale_color_grey()
+  scale_color_manual(pal1)
+  
+
+
+```
+
+### Calculate the reporting triangle
+
+How many new reported deaths were there for 2 weks ago, 3 weeks ago, 4 weeks ago...
+
+```{r}
+reporting.triangle <- readRDS('./outputs/reporting.triangle.louisiana.rds')
+View(reporting.triangle)
+```
+
+### Fit the NobBS model
+
+Number of cases repored for week t, with a delay of d weeks:
+
+n_t_d ~ Poisson(lambda_t_d)
+
+lambda_t_d = exp(alpha_t)* Beta_d
+(or equivalently (log_lambda_t_d) = alpha_t + log(beta_d) )
+
+Here alpha_t is a random walk, which ensures the true value for the current week is similar to previous weeks, and beta_d represents the proportion of cases reported with a particular delay
+
+### what do we get out?
+
+This is an estimate of the true, incompletely reported number of deaths per week compared to reported
+
+```{r}
+all.preds.df <- read.csv('./outputs/NobBs.preds.LA.csv')
+all.preds.df$death_date <- as.Date(all.preds.df$death_date)
+
+ggplot(all.preds.df, aes(x=death_date, y=obs)) +
+  geom_line() +
+  geom_ribbon(aes(x=death_date, ymin=pred.lcl, ymax=preds.ucl), alpha=0.2, fill='blue')+
+  geom_line(aes(x=death_date, y=pred.med), lty=2, col='white')+
+  ylim(0,max(all.preds.df$preds.ucl)) +
+  theme_classic()
+
+
+```
+
+We can also see the estimates for beta (proportion reported per week)
+```{r}
+probs.est <- readRDS('./outputs/Nobs.prop.reporting.LA.rds')
+
+ggplot(probs.est, aes(x=weeks.ago, y=median)) +
+  geom_line() +
+  geom_ribbon(aes(x=weeks.ago, ymin=lcl, ymax=ucl), alpha=0.2, fill='blue')+
+  geom_line(aes(x=weeks.ago, y=median), lty=2, col='white')+
+  ylab('Proportion of deaths reported in this week') +
+  xlab('Weeks since death') +
+  theme_classic()
+
+```
+
+This can instead be expressed as the proportion of deaths that have been reported by a specified number of weeks after the death. This is what we use in our harmonic regression model as the adjustment
+
+```{r}
+
+prop.complete <- read.csv('./outputs/NobBs.complete.LA.csv')
+
+ggplot(prop.complete, aes(x=week, y=Louisiana)) +
+  geom_line() +
+  ylab('Proportion of deaths reported') +
+  xlab('Weeks since deaths') +
+  ylim(0,1)+
+  theme_classic()
+
+```
+
+
