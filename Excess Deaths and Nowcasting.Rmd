@@ -9,6 +9,7 @@ library(dplyr)
 library(reshape2)
 library(lubridate)
 library(ggplot2)
+library(RColorBrewer)
 library(MASS)
 source('./functions/runIfExpired.R')
 ```
