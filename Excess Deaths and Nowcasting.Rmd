@@ -7,9 +7,9 @@ output: html_document
 knitr::opts_chunk$set(echo = TRUE)
 library(dplyr)
 library(reshape2)
+library(lubridate)
 library(ggplot2)
 library(MASS)
-library(nob)
 source('./functions/runIfExpired.R')
 ```
 
