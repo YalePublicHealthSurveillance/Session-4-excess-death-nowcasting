@@ -337,17 +337,14 @@ View different version of the data
 ```{r}
 e1.m <- melt(e1, id.vars=c('state','death_date'))
 
-pal1 = colorRampPalette(brewer.pal(9, "RdBu"))(length(unique(e1.m$variable)))
-
-
-
-ggplot(e1.m, aes(x=death_date, y=value, group=variable, color=variable)) +
+p3 <- ggplot(e1.m, aes(x=death_date, y=value, group=variable, color=variable)) +
   geom_line() +
   theme_classic()+
-  scale_color_grey()
-  scale_color_manual(pal1)
-  
-
+  scale_color_grey()+
+  ylab('N Deaths') +
+  xlab('Week of death')
+ 
+p3
 
 ```
 
