@@ -38,7 +38,9 @@ A major challenge with this type of analysis is that it was being done in real-t
 
 5.  Fit the harmonic regression model, compare observed and expected values t get excess deaths
 
-## Get the latest data
+
+
+## Part 1: Get the latest data
 
 CDC makes data available through an **API**. This allows users to directly download the data. In this case, they have "provisional" death data for 2020 onwards on <https://data.cdc.gov/NCHS/Weekly-Provisional-Counts-of-Deaths-by-State-and-S/muzy-jte6>
 
@@ -59,16 +61,127 @@ nchs.base2.data <- runIfExpired('nchs_base2_data',
  )
 ```
 
-## Harmonic Regression time!
+## Part 2: Nowcasting
+
+## Nowcasting with NobBS
+
+Taking a step back: how did we estimate the factor we used to adjust the counts from more recent weeks for reporting delays.
+
+Once we have provisional data collected over multiple weeks, we can evaluate how the data changes over time. NobBS stands for Nowcasting by Bayesian Smoothing. It is described [here](https://journals.plos.org/ploscompbiol/article?id=10.1371/journal.pcbi.1007735) in a paper by Sarah McGough. As we will see, data trickles in over the course of many weeks. The goal of NobBS is to make a guess about how many cases/deaths will eventually be reported once all the data has come in, based on past reporting patterns and underlying trends in the data.
+
+```{r}
+e1 <- readRDS('./Data/fluview_archived_data.rds') %>%
+  filter(state=='Louisiana' & death_date >= '2020-01-01' )
+
+
+View(e1)
+
+#write.csv(e1, './outputs/LA_death_archives.csv' )
+
+```
+
+View different version of the data
+
+```{r}
+e1.m <- melt(e1, id.vars=c('state','death_date'))
+
+p3 <- ggplot(e1.m, aes(x=death_date, y=value, group=variable, color=variable)) +
+  geom_line() +
+  theme_classic()+
+  scale_color_grey()+
+  ylab('N Deaths') +
+  xlab('Week of death')
+ 
+p3
+
+```
+
+### Calculate the reporting triangle
+
+How many new reported deaths were there for 2 weks ago, 3 weeks ago, 4 weeks ago...
+
+```{r}
+reporting.triangle <- readRDS('./outputs/reporting.triangle.louisiana.rds')
+View(reporting.triangle)
+```
+
+What proportion are reported in each week?. Note this is not quite right because for more recent weeks, we are not observing the full delay distribution
+
+```{r}
+proportion <- reporting.triangle %>%
+  apply(1, function(x){ x/sum(x, na.rm=T)}) %>% #divide each value by the sum of the row
+  t() #transpose
+```
+
+
+### Fit the NobBS model
+
+Number of cases reported for week t, with a delay of d weeks:
+
+n_t_d ~ Poisson(lambda_t_d)
+
+lambda_t_d = exp(alpha_t)* Beta_d
+(or equivalently (log_lambda_t_d) = alpha_t + log(beta_d) )
+
+Here alpha_t is a random walk, which ensures the true value for the current week is similar to previous weeks, and beta_d represents the proportion of cases reported with a particular delay
+
+### what do we get out?
+
+This is an estimate of the true, incompletely reported number of deaths per week compared to reported
+
+```{r}
+all.preds.df <- read.csv('./outputs/NobBs.preds.LA.csv')
+all.preds.df$death_date <- as.Date(all.preds.df$death_date)
+
+ggplot(all.preds.df, aes(x=death_date, y=obs)) +
+  geom_line() +
+  geom_ribbon(aes(x=death_date, ymin=pred.lcl, ymax=preds.ucl), alpha=0.2, fill='blue')+
+  geom_line(aes(x=death_date, y=pred.med), lty=2, col='white')+
+  ylim(0,max(all.preds.df$preds.ucl)) +
+  theme_classic()
+
+
+```
+
+We can also see the estimates for beta (proportion reported per week)
+```{r}
+probs.est <- readRDS('./outputs/Nobs.prop.reporting.LA.rds')
+
+ggplot(probs.est, aes(x=weeks.ago, y=median)) +
+  geom_line() +
+  geom_ribbon(aes(x=weeks.ago, ymin=lcl, ymax=ucl), alpha=0.2, fill='blue')+
+  geom_line(aes(x=weeks.ago, y=median), lty=2, col='white')+
+  ylab('Proportion of deaths reported in this week') +
+  xlab('Weeks since death') +
+  theme_classic()
+
+```
+
+This can instead be expressed as the proportion of deaths that have been reported by a specified number of weeks after the death. This is what we use in our harmonic regression model as the adjustment
+
+```{r}
+
+prop.complete <- read.csv('./outputs/NobBs.complete.LA.csv')
+
+ggplot(prop.complete, aes(x=week, y=Louisiana)) +
+  geom_line() +
+  ylab('Proportion of deaths reported') +
+  xlab('Weeks since deaths') +
+  ylim(0,1)+
+  theme_classic()
+
+```
+
+
+
+## Part 3: Harmonic Regression time!
 
 Here we are going to fit a harmonic regression to data from the pre-pandemic period (before March 1, 2020) and extrapolate it forward
 
 ```{r}
-d1 <- readRDS('./Data/processed_data.rds')
-
-d1 <- d1[d1$state=='MA' ,]
-
-d1$deaths.corrected <- d1$nchs.total.deaths/d1$prop.complete
+d1 <- readRDS('./Data/processed_data.rds') %>%
+  filter(state=='LA') %>%
+  mutate(deaths.corrected =  nchs.total.deaths/ prop.complete )
 
 ```
 
@@ -77,7 +190,7 @@ d1$deaths.corrected <- d1$nchs.total.deaths/d1$prop.complete
 p1 <- ggplot(d1, aes( x=week_end , y= nchs.total.deaths) ) +
   geom_line() +
   theme_classic() +
-  ylim(0, max(c(d1$nchs.total.deaths, d1$deaths.corrected)))
+  ylim(0, NA) 
 
 p1 +
   geom_line(data=d1, aes(x=week_end, y=deaths.corrected), lty=2, col='red')
@@ -99,25 +212,26 @@ Create the harmonic variables
 
 ```{r}
 
-d1 <- d1[order(d1$week_end),]
+d1 <- d1 %>%
+  arrange(week_end) %>% #sort bydate
+  mutate( t = row_number(),
+          sin1 = sin(2*pi*t/52.143),
+          cos1 = cos(2*pi*t/52.143),
+          
+          sin2 = sin(2*pi*t*2/52.143),
+          cos2 = cos(2*pi*t*2/52.143),
+          
+          sin3 = sin(2*pi*t*3/52.143),
+          cos3 = cos(2*pi*t*3/52.143),
+          )
 
-d1$t <- 1: nrow(d1)
-
-d1$sin1 <- sin(2*pi*d1$t/52.143)
-d1$cos1 <- cos(2*pi*d1$t/52.143)
-
-d1$sin2 <- sin(2*pi*d1$t*2/52.143)
-d1$cos2 <- cos(2*pi*d1$t*2/52.143)
-
-d1$sin3 <- sin(2*pi*d1$t*3/52.143)
-d1$cos3 <- cos(2*pi*d1$t*3/52.143)
 ```
 
 Define outcome as total deaths per week before pandemic. Set deaths during pandemic to missing (NA)
 
 ```{r}
-d1$deaths.pre <- d1$nchs.total.deaths
-d1$deaths.pre[d1$week_end >= '2020-03-01'] <- NA
+d1 <- d1 %>%
+  mutate( deaths.pre = if_else(d1$week_end < '2020-03-01', nchs.total.deaths, NA_real_ ))
 
 ```
 
@@ -172,7 +286,7 @@ round(sum(d1$excess[d1$week_end>='2020-03-01']),-2)
 
 Let's try with another state (FL)
 
-## Calculating uncertainty: 2-stage Monte Carlo approach
+## Part 4: Calculating uncertainty: 2-stage Monte Carlo approach
 
 ### Prediction Intervals vs confidence intervals
 
@@ -317,102 +431,5 @@ round(excess2, -2)
  
 ```
 
-## Nowcasting with NobBS
-
-Taking a step back: how did we estimate the factor we used to adjust the counts from more recent weeks for reporting delays.
-
-Once we have provisional data collected over multiple weeks, we can evaluate how the data changes over time. NobBS stands for Nowcasting by Bayesian Smoothing. It is described [here](https://journals.plos.org/ploscompbiol/article?id=10.1371/journal.pcbi.1007735) in a paper by Sarah McGough. As we will see, data trickles in over the course of many weeks. The goal of NobBS is to make a guess about how many cases/deaths will eventually be reported once all the data has come in, based on past reporting patterns and underlying trends in the data.
-
-```{r}
-e1 <- readRDS('./Data/fluview_archived_data.rds')
-
-e1 <- e1[e1$state=='Louisiana' & e1$death_date >= '2020-01-01',]
-
-View(e1)
-
-```
-
-View different version of the data
-
-```{r}
-e1.m <- melt(e1, id.vars=c('state','death_date'))
-
-p3 <- ggplot(e1.m, aes(x=death_date, y=value, group=variable, color=variable)) +
-  geom_line() +
-  theme_classic()+
-  scale_color_grey()+
-  ylab('N Deaths') +
-  xlab('Week of death')
- 
-p3
-
-```
-
-### Calculate the reporting triangle
-
-How many new reported deaths were there for 2 weks ago, 3 weeks ago, 4 weeks ago...
-
-```{r}
-reporting.triangle <- readRDS('./outputs/reporting.triangle.louisiana.rds')
-View(reporting.triangle)
-```
-
-### Fit the NobBS model
-
-Number of cases repored for week t, with a delay of d weeks:
-
-n_t_d ~ Poisson(lambda_t_d)
-
-lambda_t_d = exp(alpha_t)* Beta_d
-(or equivalently (log_lambda_t_d) = alpha_t + log(beta_d) )
-
-Here alpha_t is a random walk, which ensures the true value for the current week is similar to previous weeks, and beta_d represents the proportion of cases reported with a particular delay
-
-### what do we get out?
-
-This is an estimate of the true, incompletely reported number of deaths per week compared to reported
-
-```{r}
-all.preds.df <- read.csv('./outputs/NobBs.preds.LA.csv')
-all.preds.df$death_date <- as.Date(all.preds.df$death_date)
-
-ggplot(all.preds.df, aes(x=death_date, y=obs)) +
-  geom_line() +
-  geom_ribbon(aes(x=death_date, ymin=pred.lcl, ymax=preds.ucl), alpha=0.2, fill='blue')+
-  geom_line(aes(x=death_date, y=pred.med), lty=2, col='white')+
-  ylim(0,max(all.preds.df$preds.ucl)) +
-  theme_classic()
-
-
-```
-
-We can also see the estimates for beta (proportion reported per week)
-```{r}
-probs.est <- readRDS('./outputs/Nobs.prop.reporting.LA.rds')
-
-ggplot(probs.est, aes(x=weeks.ago, y=median)) +
-  geom_line() +
-  geom_ribbon(aes(x=weeks.ago, ymin=lcl, ymax=ucl), alpha=0.2, fill='blue')+
-  geom_line(aes(x=weeks.ago, y=median), lty=2, col='white')+
-  ylab('Proportion of deaths reported in this week') +
-  xlab('Weeks since death') +
-  theme_classic()
-
-```
-
-This can instead be expressed as the proportion of deaths that have been reported by a specified number of weeks after the death. This is what we use in our harmonic regression model as the adjustment
-
-```{r}
-
-prop.complete <- read.csv('./outputs/NobBs.complete.LA.csv')
-
-ggplot(prop.complete, aes(x=week, y=Louisiana)) +
-  geom_line() +
-  ylab('Proportion of deaths reported') +
-  xlab('Weeks since deaths') +
-  ylim(0,1)+
-  theme_classic()
-
-```
 
 
